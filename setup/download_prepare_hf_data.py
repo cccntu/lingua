@@ -82,6 +82,7 @@ def main(dataset, memory, data_dir, seed=42, nchunks=32):
         "fineweb_edu_10bt": "HuggingFaceFW/fineweb-edu",
         "dclm_baseline_1.0": "mlfoundations/dclm-baseline-1.0",
         "dclm_baseline_1.0_10prct": "mlfoundations/dclm-baseline-1.0",
+        "dclm_baseline_1.0_1prct": "mlfoundations/dclm-baseline-1.0",
     }[dataset]
     src_dir = f"{data_dir}/{dataset}"
     out_dir = f"{src_dir}_shuffled"
@@ -93,18 +94,21 @@ def main(dataset, memory, data_dir, seed=42, nchunks=32):
         "fineweb_edu_10bt": ".jsonl",
         "dclm_baseline_1.0": ".jsonl.zst",
         "dclm_baseline_1.0_10prct": ".jsonl.zst",
+        "dclm_baseline_1.0_1prct": ".jsonl.zst",
     }[dataset]
     cat_command = {
         "fineweb_edu": "cat",
         "fineweb_edu_10bt": "cat",
         "dclm_baseline_1.0": "zstdcat",
         "dclm_baseline_1.0_10prct": "zstdcat",
+        "dclm_baseline_1.0_1prct": "zstdcat",
     }[dataset]
     allow_patterns = {
         "fineweb_edu": None,
         "fineweb_edu_10bt": "sample/10BT/*",
         "dclm_baseline_1.0": "*.jsonl.zst",
         "dclm_baseline_1.0_10prct": "global-shard_01_of_10/*.jsonl.zst",
+        "dclm_baseline_1.0_1prct": "global-shard_01_of_10/local-shard_0_of_10/*.jsonl.zst",
     }[dataset]
     suffix = ".jsonl"
     k_validation = 10000  # Number of lines to take from each chunk for validation
