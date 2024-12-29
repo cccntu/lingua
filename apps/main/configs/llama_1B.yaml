@@ -26,8 +26,8 @@ model:
 
 data:
   root_dir: data/shuffled
-  sources:
-    dclm_baseline_1.0: 100.0
+  #sources:
+  #  dclm_baseline_1.0: 100.0
   batch_size: 4
   prefetch_size: 1024
   seq_len: 4096
