@@ -237,6 +237,9 @@ def setup_torch_distributed(dist_args):
     """
     Handle single and multi-GPU / multi-node / SLURM jobs.
     """
+    local_rank = int(os.environ.get('LOCAL_RANK', '0'))  # Get directly from env
+    torch.cuda.set_device(local_rank)  # Set device first thing
+
     mp.set_start_method(dist_args.spawn_method)
     with mp.Manager():
         pass
