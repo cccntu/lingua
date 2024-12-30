@@ -1,6 +1,5 @@
 import os
 import logging
-from dataclasses import dataclass
 import torch
 import torch.distributed as dist
 from lingua.distributed import (
@@ -10,29 +9,30 @@ from lingua.distributed import (
     setup_env,
     EnvironmentArgs
 )
-from omegaconf import OmegaConf
 
 logger = logging.getLogger(__name__)
 
-@dataclass
-class TestArgs:
-    # Minimal version of TrainArgs
-    distributed: DistributedArgs = DistributedArgs()
-    env: EnvironmentArgs = EnvironmentArgs()
-    
 def create_dummy_data(batch_size, seq_len, vocab_size):
-    # Create random input tokens and labels
     input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
     labels = torch.randint(0, vocab_size, (batch_size, seq_len))
     return input_ids, labels
 
-def test_distributed(args: TestArgs):
-    # Setup environment
-    setup_env(args.env)
-    setup_torch_distributed(args.distributed)
+def main():
+    # Fixed distributed args
+    dist_args = DistributedArgs(
+        dp_replicate=2,  # Number of data parallel replicas 
+        dp_shard=1,      # No FSDP sharding
+        tp_size=1,       # No tensor parallelism
+        fsdp_type="no_shard"
+    )
+    env_args = EnvironmentArgs()
+    
+    # Setup distributed environment
+    setup_env(env_args)
+    setup_torch_distributed(dist_args)
     
     # Get world info
-    world_mesh = get_device_mesh(args.distributed)
+    world_mesh = get_device_mesh(dist_args)
     dp_mesh = world_mesh["dp_replicate"]
     dp_degree = dp_mesh.size()
     dp_rank = dp_mesh.get_local_rank()
@@ -88,21 +88,6 @@ def test_distributed(args: TestArgs):
         
         if dp_rank == 0:
             logger.info(f"Step {step}, Reduced Loss: {gathered_loss.item()}")
-            
-def main():
-    """
-    Main function that handles config loading similar to train.py
-    """
-    cli_args = OmegaConf.from_cli()
-    
-    # Initialize with default config
-    default_cfg = OmegaConf.structured(TestArgs())
-    
-    # Merge with CLI args
-    cfg = OmegaConf.merge(default_cfg, cli_args)
-    cfg = OmegaConf.to_object(cfg)
-    
-    test_distributed(cfg)
 
 if __name__ == "__main__":
     main()
