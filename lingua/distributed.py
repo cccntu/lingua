@@ -236,9 +236,6 @@ def setup_env(env_args):
 def setup_torch_distributed(dist_args):
     """
     Handle single and multi-GPU / multi-node / SLURM jobs.
-    Initialize the following variables:
-        - global_rank
-        - world_size
     """
     mp.set_start_method(dist_args.spawn_method)
     with mp.Manager():
@@ -262,7 +259,12 @@ def setup_torch_distributed(dist_args):
 
     logger.info(f"ENV: {os.environ}")
 
-    # set GPU device
+    # Force CUDA initialization before NCCL
+    if torch.cuda.is_available():
+        torch.cuda.set_device(local_rank)
+        # Force CUDA initialization
+        torch.zeros(1, device=f"cuda:{local_rank}")
+
     assert 0 <= local_rank < 8
     if dist_args.matmul_allow_tf32:
         torch.backends.cuda.matmul.allow_tf32 = True
@@ -272,11 +274,8 @@ def setup_torch_distributed(dist_args):
     torch.backends.cuda.matmul.allow_bf16_reduced_precision_reduction = (
         dist_args.allow_bf16_reduced_precision_reduction
     )
-    if torch.cuda.device_count() > 1:
-        torch.cuda.set_device(local_rank)
     torch.distributed.init_process_group(init_method="env://", backend="nccl")
     torch.autograd.set_detect_anomaly(dist_args.detect_anomaly)
-
 
 def get_module(module, access_string):
     names = access_string.split(sep=".")
