@@ -3,57 +3,59 @@ import logging
 import torch
 import torch.distributed as dist
 from lingua.distributed import (
-    DistributedArgs,
+    setup_torch_distributed, 
+    DistributedArgs, 
+    get_device_mesh,
+    setup_env,
     EnvironmentArgs,
 )
 
 logger = logging.getLogger(__name__)
 
 def main():
-    # 1. Basic CUDA setup and info
+    # 1. Basic setup
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     world_size = int(os.environ.get('WORLD_SIZE', 1))
     
-    print(f"Initial setup:")
+    print(f"Initial setup on rank {local_rank}:")
     print(f"  CUDA available: {torch.cuda.is_available()}")
     print(f"  CUDA device count: {torch.cuda.device_count()}")
-    print(f"  Local rank: {local_rank}")
-    print(f"  World size: {world_size}")
     
-    # 2. Set device first
+    # 2. ALWAYS set device, regardless of device count
+    print(f"Setting CUDA device for rank {local_rank}")
     torch.cuda.set_device(local_rank)
-    print(f"Set CUDA device to: {torch.cuda.current_device()}")
+    assert torch.cuda.current_device() == local_rank
+    print(f"Current CUDA device: {torch.cuda.current_device()}")
     
-    # 3. Initialize process group directly first
-    print("\nInitializing process group directly...")
-    dist.init_process_group(backend="nccl")
-    print("Direct process group initialization successful!")
-    
-    # 4. Create and move a tensor to verify CUDA access
-    try:
-        x = torch.ones(1, device=f'cuda:{local_rank}')
-        print(f"Successfully created tensor on {x.device}")
-        
-        # Test all_reduce
-        dist.all_reduce(x)
-        print(f"Successfully completed all_reduce, result: {x.item()}")
-    except Exception as e:
-        print(f"Error in tensor operations: {e}")
-        raise
-    
-    # 5. Now try lingua setup
-    print("\nSetting up lingua distributed args...")
+    # 3. Initialize distributed args
     dist_args = DistributedArgs(
-        dp_replicate=world_size,
-        dp_shard=1,
-        tp_size=1,
+        dp_replicate=world_size,  # Match torchrun's world size
+        dp_shard=1,     
+        tp_size=1,      
         fsdp_type="no_shard"
     )
+    env_args = EnvironmentArgs()
     
-    print(f"Proceeding with process cleanup...")
+    # 4. Setup environment and distributed
+    print(f"Setting up distributed environment on rank {local_rank}...")
+    setup_env(env_args)
+    setup_torch_distributed(dist_args)
+    
+    # 5. Verify distributed setup
+    print(f"\nVerifying setup on rank {local_rank}:")
+    print(f"  World size: {dist.get_world_size()}")
+    print(f"  Rank: {dist.get_rank()}")
+    print(f"  Current device: {torch.cuda.current_device()}")
+    
+    # 6. Test tensor operations
+    x = torch.ones(1, device=f'cuda:{local_rank}')
+    dist.all_reduce(x)
+    print(f"All reduce result on rank {local_rank}: {x.item()}")
+    
     dist.barrier()
+    if local_rank == 0:
+        print("All processes completed successfully!")
     dist.destroy_process_group()
-    print(f"Rank {local_rank} completed successfully!")
 
 if __name__ == "__main__":
     main()
