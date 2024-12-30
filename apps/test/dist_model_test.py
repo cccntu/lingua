@@ -2,52 +2,73 @@ import os
 import logging
 import torch
 import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 
 logger = logging.getLogger(__name__)
 
+def create_dummy_data(batch_size, seq_len, vocab_size):
+    input_ids = torch.randint(0, vocab_size, (batch_size, seq_len))
+    labels = torch.randint(0, vocab_size, (batch_size, seq_len))
+    return input_ids, labels
+
 def main():
-    # 1. Print CUDA info first
-    print(f"CUDA available: {torch.cuda.is_available()}")
-    print(f"CUDA device count: {torch.cuda.device_count()}")
-    
-    # 2. Get local rank and set device before anything else
+    # 1. Basic CUDA and device setup
     local_rank = int(os.environ.get('LOCAL_RANK', 0))
     print(f"Setting device for rank {local_rank}")
+    torch.cuda.set_device(local_rank)
+    device = torch.device(f'cuda:{local_rank}')
     
-    # Set the device first
-    if local_rank >= torch.cuda.device_count():
-        raise ValueError(f"Local rank {local_rank} >= GPU count {torch.cuda.device_count()}")
+    # 2. Initialize process group
+    print("Initializing process group...")
+    dist.init_process_group(backend="nccl")
+    print(f"Process group initialized! Rank {dist.get_rank()} of {dist.get_world_size()}")
+    
+    # 3. Model parameters
+    batch_size = 4
+    seq_len = 128
+    vocab_size = 32000
+    hidden_size = 768
+    
+    # 4. Create model
+    print("Creating model...")
+    model = torch.nn.Sequential(
+        torch.nn.Embedding(vocab_size, hidden_size),
+        torch.nn.Linear(hidden_size, vocab_size)
+    ).to(device)
+    
+    # 5. Wrap model with DDP
+    print("Wrapping model with DDP...")
+    model = DDP(model, device_ids=[local_rank])
+    print("Model created and wrapped!")
+    
+    # 6. Create optimizer
+    optimizer = torch.optim.Adam(model.parameters(), lr=0.001)
+    
+    # 7. Training loop
+    print("Starting training loop...")
+    model.train()
+    for step in range(3):
+        # Create dummy data
+        input_ids, labels = create_dummy_data(batch_size, seq_len, vocab_size)
+        input_ids = input_ids.to(device)
+        labels = labels.to(device)
         
-    # 3. Try each CUDA operation separately
-    try:
-        torch.cuda.set_device(local_rank)
-        print(f"Successfully set CUDA device to {local_rank}")
+        # Forward pass
+        optimizer.zero_grad()
+        logits = model(input_ids)
+        loss = torch.nn.functional.cross_entropy(logits.view(-1, vocab_size), labels.view(-1))
         
-        # Test device is working
-        x = torch.zeros(1, device=f'cuda:{local_rank}')
-        print(f"Successfully created tensor on device {x.device}")
+        # Backward and optimize
+        loss.backward()
+        optimizer.step()
         
-        # Initialize process group
-        print("Initializing process group...")
-        dist.init_process_group(backend="nccl")
-        print(f"Process group initialized successfully!")
-        print(f"World size: {dist.get_world_size()}")
-        print(f"Rank: {dist.get_rank()}")
-        
-        # Test basic distributed operation
-        test_tensor = torch.ones(1, device=f'cuda:{local_rank}')
-        dist.all_reduce(test_tensor)
-        print(f"Successfully completed all_reduce, result: {test_tensor.item()}")
-        
+        # Print progress
+        if dist.get_rank() == 0:
+            print(f"Step {step}, Loss: {loss.item()}")
         dist.barrier()
-        print("Successfully created barrier")
-        
-        dist.destroy_process_group()
-        print("Successfully destroyed process group")
-        
-    except Exception as e:
-        print(f"Error occurred: {str(e)}")
-        raise
+    
+    print(f"Rank {dist.get_rank()} completed training!")
+    dist.destroy_process_group()
 
 if __name__ == "__main__":
     main()
