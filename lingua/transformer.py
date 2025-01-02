@@ -45,6 +45,7 @@ class BaseTransformerArgs:
 
     init_base_std: Optional[float] = None
     init_std_factor: str = "disabled"
+    rope_type: str = "original" # can be additive
 
     max_seqlen: int = 1024
 
@@ -95,7 +96,7 @@ def precompute_freqs_cis(dim: int, end: int, theta: float = 10000.0):
     return torch.stack((cos, -sin, sin, cos), dim=-1).view(*freqs.size(), 2, 2)
 
 
-def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor, seq_dim: int):
+def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor, seq_dim: int, add_rope=False):
     """
     Reshape frequency tensor for broadcasting it with another tensor.
 
@@ -112,15 +113,26 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor, seq_dim: int
     """
     ndim = x.ndim
     assert 0 <= seq_dim < ndim
-    assert freqs_cis.shape == (
-        x.shape[seq_dim],
-        x.shape[-3],
-        2,
-        2,
-    ), f"freqs_cis vs x: {(freqs_cis.shape, x.shape)}"
-    shape = [
-        d if i == seq_dim or i == ndim - 3 else 1 for i, d in enumerate(x.shape[:-2])
-    ] + [2, 2]
+    if not add_rope:
+        assert freqs_cis.shape == (
+            x.shape[seq_dim],
+            x.shape[-3],
+            2,
+            2,
+        ), f"freqs_cis vs x: {(freqs_cis.shape, x.shape)}"
+        shape = [
+            d if i == seq_dim or i == ndim - 3 else 1 for i, d in enumerate(x.shape[:-2])
+        ] + [2, 2]
+    else:
+        assert freqs_cis.shape == (
+            x.shape[seq_dim],
+            x.shape[-2],
+            2,
+        ), f"freqs_cis vs x: {(freqs_cis.shape, x.shape)}"
+        shape = [
+            d if i == seq_dim or i == ndim - 3 else 1 for i, d in enumerate(x.shape[:-1])
+        ] + [2]
+
     return freqs_cis.view(*shape)
 
 
@@ -130,13 +142,48 @@ def apply_rotary_emb(
     seq_dim: int,
     freqs_cis: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
+    # xq & xk: bsz, seq_len, self.n_heads, self.head_dim
     xq_ = xq.reshape(*xq.shape[:-1], -1, 1, 2)  # B S H D -> B S H D/2 1 2
     xk_ = xk.reshape(*xk.shape[:-1], -1, 1, 2)  # B S H D -> B S H D/2 1 2
     freqs_cis = reshape_for_broadcast(
         freqs_cis, xq_, seq_dim
     ).float()  # S D/2 2 2 -> 1 S 1 D/2 2 2
+
+    # impl note:
+    #return torch.stack((cos, -sin, sin, cos), dim=-1).view(
+        #pos.shape[0], self.n_heads, self.head_dim//2, 2, 2
+    #)
+    # outupt =
+    # cos x - sin y
+    # sin x + cos y
     xq_out = (xq_ * freqs_cis).sum(5).flatten(3)
     xk_out = (xk_ * freqs_cis).sum(5).flatten(3)
+    return xq_out.type_as(xq), xk_out.type_as(xk)
+
+
+def apply_additive_rotary_emb(
+    xq: torch.Tensor,
+    xk: torch.Tensor,
+    seq_dim: int,
+    freqs_cis: Tuple[torch.Tensor],
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    # xq & xk: bsz, seq_len, self.n_heads, self.head_dim
+    # freqs_cis:
+    # torch.stack((cos, sin), dim=-1).view(
+    #        pos.shape[0], self.n_heads, self.head_dim//2, 2
+    #    )
+    xq_ = xq.reshape(*xq.shape[:-1], -1, 2)  # B S H D -> B S H D/2 2
+    xk_ = xk.reshape(*xk.shape[:-1], -1, 2)  # B S H D -> B S H D/2 2
+
+    assert q_emb.dtype == torch.float32, "q_emb should be float32"
+    assert k_emb.dtype == torch.float32, "k_emb should be float32"
+    q_emb = reshape_for_broadcast(q_emb, xq_, seq_dim, add_rope=True)
+    k_emb = reshape_for_broadcast(k_emb, xk_, seq_dim, add_rope=True)
+
+    # Additive version instead of multiplicative
+    xq_out = (xq_ + q_emb).flatten(3)
+    xk_out = (xk_ + k_emb).flatten(3)
+
     return xq_out.type_as(xq), xk_out.type_as(xk)
 
 
@@ -261,6 +308,80 @@ class RotaryEmbedding(torch.nn.Module):
         elif seqlen is not None:
             return self.freqs_cis[0:seqlen]
 
+class AdditiveRotaryEmbedding(torch.nn.Module):
+    def __init__(self, head_dim: int, n_heads: int, max_seqlen: int = 1024, theta: float = 10000.0):
+        super().__init__()
+        self.head_dim = head_dim
+        self.n_heads = n_heads
+        self.max_seqlen = max_seqlen
+        self.theta = theta
+        n_freqs = head_dim // 2
+        assert n_freqs * 2 == head_dim, "head_dim must be divisible by 2"
+
+        # Learnable parameters for query and key heads
+        self.q_phase = nn.Parameter(torch.zeros(n_heads, n_freqs, dtype=torch.float32))
+        self.k_phase = nn.Parameter(torch.zeros(n_heads, n_freqs, dtype=torch.float32))
+        self.q_amplitude = nn.Parameter(torch.ones(n_heads, n_freqs, dtype=torch.float32))
+        self.k_amplitude = nn.Parameter(torch.ones(n_heads, n_freqs, dtype=torch.float32))
+
+        # Precompute inverse frequencies
+        inv_freq = 1.0 / (theta ** (torch.arange(0, n_freqs, dtype=torch.float32) / n_freqs))
+        self.register_buffer('inv_freq', inv_freq)
+
+    def forward(self, seqlen: Optional[int] = None, tok_idx: Optional[torch.Tensor] = None):
+        """
+        Compute rotary embeddings for query and key tensors.
+
+        Args:
+            seqlen (Optional[int]): Length of sequence for consecutive positions
+            tok_idx (Optional[torch.Tensor]): Position indices for each token
+
+        Returns:
+            torch.Tensor: Positional embeddings tensor
+        """
+        assert (seqlen is not None) or (tok_idx is not None), "Must provide either seqlen or tok_idx"
+
+        if tok_idx is not None:
+            pos = tok_idx
+            assert torch.all(pos < self.max_seqlen), f"Token indices must be less than max_seqlen ({self.max_seqlen})"
+        else:
+            assert seqlen <= self.max_seqlen, f"seqlen ({seqlen}) must be <= max_seqlen ({self.max_seqlen})"
+            pos = torch.arange(seqlen or self.max_seqlen, device=self.inv_freq.device)
+
+        def compute_embeddings(pos, phase, amplitude):
+            # pos: [seq_len]
+            # phase: [n_heads, n_freqs]
+            # amplitude: [n_heads, n_freqs]
+            L = pos.size(0)
+            H = phase.size(0)
+            F = self.inv_freq.size(0)
+
+            # [seq_len, 1, 1]
+            pos = pos.view(L, 1, 1)
+            # [1, 1, n_freqs]
+            inv_freq = self.inv_freq.view(1, 1, F)
+
+            # [seq_len, n_heads, n_freqs]
+            x = pos.float() * inv_freq + phase.view(1, H, F)
+
+            sin = x.sin() * amplitude.view(1, H, F)
+            cos = x.cos() * amplitude.view(1, H, F)
+
+            return torch.stack((cos, sin), dim=-1).view(L, H, F, 2)
+
+        # Compute embeddings for queries and keys
+        q_emb = compute_embeddings(pos, self.q_phase, self.q_amplitude)
+        k_emb = compute_embeddings(pos, self.k_phase, self.k_amplitude)
+
+        # Stack and reshape to match expected output format
+        return q_emb, k_emb
+
+    def reset_parameters(self):
+        nn.init.zeros_(self.q_phase)
+        nn.init.zeros_(self.k_phase):
+        nn.init.zeros_(self.phase)
+        nn.init.ones_(self.amplitude)
+
 
 class RMSNorm(nn.Module):
     """
@@ -341,6 +462,7 @@ class Attention(nn.Module):
         tok_idx: Optional[torch.Tensor] = None,
         mask: Optional[Union[BlockMask, "AttentionBias", str]] = None,
         attn_impl: str = "sdpa",
+        rope_type: str = "original",
     ) -> torch.Tensor:
         # B S D
         bsz, seq_len, dim = x.shape
@@ -354,7 +476,12 @@ class Attention(nn.Module):
         xk = xk.view(bsz, seq_len, self.n_kv_heads, self.head_dim)
         xv = xv.view(bsz, seq_len, self.n_kv_heads, self.head_dim)
 
-        xq, xk = apply_rotary_emb(xq, xk, 1, freq_cis[0:seq_len])
+        if rope_type == "original":
+            xq, xk = apply_rotary_emb(xq, xk, 1, freq_cis[0:seq_len])
+        elif rope_type == "additive":
+            xq, xk = apply_additive_rotary_emb(xq, xk, 1, freq_cis[0:seq_len])
+        else:
+            raise ValueError(f"Unsupported rotary type: {rope_type}")
 
         # This condition helps us be easily compatible
         # with inference by adding a pluggable KVCache
@@ -497,12 +624,21 @@ class TransformerBlock(nn.Module):
         assert args.n_heads % self.n_kv_heads == 0
         assert args.dim % args.n_heads == 0
 
+        if args.rope_type == "additive":
+            self.rope_embeddings = AdditiveRotaryEmbedding(
+                head_dim=self.head_dim,
+                n_heads=self.n_heads,
+                max_seqlen=args.max_seqlen,
+                theta=args.rope_theta,
+            )
+
         self.attention = Attention(
             dim=args.dim,
             head_dim=self.head_dim,
             n_heads=self.n_heads,
             n_kv_heads=self.n_kv_heads,
             rope_theta=args.rope_theta,
+            rope_type=args.rope_type,
         )
         self.feed_forward = FeedForward(
             dim=args.dim,
@@ -521,6 +657,12 @@ class TransformerBlock(nn.Module):
         mask: Optional[Union[BlockMask, AttentionBias, str]] = None,
         attn_impl: str = "sdpa",
     ) -> torch.Tensor:
+        # For additive RoPE, compute freq_cis here
+        if hasattr(self, 'rope_embeddings'):
+            freq_cis = self.rope_embeddings(
+                seqlen=x.size(1) if tok_idx is None else None,
+                tok_idx=tok_idx
+            )
 
         h = x + self.attention(
             self.attention_norm(x),
@@ -528,6 +670,7 @@ class TransformerBlock(nn.Module):
             tok_idx=tok_idx,
             mask=mask,
             attn_impl=attn_impl,
+            rope_type=self.rope_type,
         )
         out = h + self.feed_forward(self.ffn_norm(h))
         return out
@@ -547,11 +690,14 @@ class BaseTransformer(nn.Module):
         self.init_base_std = args.init_base_std
         self.init_std_factor = InitStdFactor(args.init_std_factor)
         self.max_seqlen = args.max_seqlen
-        self.rope_embeddings = RotaryEmbedding(
-            theta=args.rope_theta,
-            head_dim=args.head_dim or args.dim // args.n_heads,
-            max_seqlen=args.max_seqlen,
-        )
+
+        # Only create RoPE embeddings in parent for original version
+        if args.rope_type == "original":
+            self.rope_embeddings = RotaryEmbedding(
+                theta=args.rope_theta,
+                head_dim=args.head_dim or args.dim // args.n_heads,
+                max_seqlen=args.max_seqlen,
+            )
 
         self.layers = nn.ModuleList()
         for _ in range(args.n_layers):
@@ -564,16 +710,23 @@ class BaseTransformer(nn.Module):
         mask: Optional[Union[BlockMask, AttentionBias, str]] = None,
         attn_impl: str = "sdpa",
     ):
+        # Compute freq_cis once for original RoPE
+        if hasattr(self, 'rope_embeddings'):
+            freq_cis = self.rope_embeddings(
+                seqlen=h.size(1) if tok_idx is None else None,
+                tok_idx=tok_idx
+            )
+        else:
+            freq_cis = None  # Will be computed per-layer for additive RoPE
 
-        freq_cis = self.rope_embeddings(seqlen=self.max_seqlen, tok_idx=tok_idx)
-
-        for i, layer in enumerate(self.layers):
+        for layer in self.layers:
             h = layer(h, freq_cis, tok_idx=tok_idx, mask=mask, attn_impl=attn_impl)
         return h
 
     def reset_parameters(self):
         # Either use fixed base std or sqrt model dim
-        self.rope_embeddings.reset_parameters()
+        if hasattr(self, 'rope_embeddings'):
+            self.rope_embeddings.reset_parameters()
 
     def init_weights(self):
         self.reset_parameters()
