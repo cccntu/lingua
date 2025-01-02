@@ -126,14 +126,18 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor, seq_dim: int
     else:
         assert freqs_cis.shape == (
             x.shape[seq_dim],
+            x.shape[-3],
             x.shape[-2],
             2,
         ), f"freqs_cis vs x: {(freqs_cis.shape, x.shape)}"
-        shape = [
-            d if i == seq_dim or i == ndim - 3 else 1 for i, d in enumerate(x.shape[:-1])
-        ] + [2]
+        #shape = [
+        #    d if i == seq_dim or i == ndim - 3 else 1 for i, d in enumerate(x.shape[:-1])
+        #] + [2]
+        # impl note:
+        # original rope is same across head
+        # additive rope is different for each head and both q and k
 
-    return freqs_cis.view(*shape)
+    return freqs_cis.view(*x.shape[1:])
 
 
 def apply_rotary_emb(
@@ -175,6 +179,7 @@ def apply_additive_rotary_emb(
     xq_ = xq.reshape(*xq.shape[:-1], -1, 2)  # B S H D -> B S H D/2 2
     xk_ = xk.reshape(*xk.shape[:-1], -1, 2)  # B S H D -> B S H D/2 2
 
+    q_emb, k_emb = freqs_cis
     assert q_emb.dtype == torch.float32, "q_emb should be float32"
     assert k_emb.dtype == torch.float32, "k_emb should be float32"
     q_emb = reshape_for_broadcast(q_emb, xq_, seq_dim, add_rope=True)
@@ -321,13 +326,12 @@ class AdditiveRotaryEmbedding(torch.nn.Module):
         # Learnable parameters for query and key heads
         self.q_phase = nn.Parameter(torch.zeros(n_heads, n_freqs, dtype=torch.float32))
         self.k_phase = nn.Parameter(torch.zeros(n_heads, n_freqs, dtype=torch.float32))
-        self.q_amplitude = nn.Parameter(torch.ones(n_heads, n_freqs, dtype=torch.float32))
-        self.k_amplitude = nn.Parameter(torch.ones(n_heads, n_freqs, dtype=torch.float32))
+        self.q_weight = nn.Parameter(torch.ones(n_heads, n_freqs, dtype=torch.float32))
+        self.k_weight = nn.Parameter(torch.ones(n_heads, n_freqs, dtype=torch.float32))
 
         # Precompute inverse frequencies
         inv_freq = 1.0 / (theta ** (torch.arange(0, n_freqs, dtype=torch.float32) / n_freqs))
         self.register_buffer('inv_freq', inv_freq)
-
     def forward(self, seqlen: Optional[int] = None, tok_idx: Optional[torch.Tensor] = None):
         """
         Compute rotary embeddings for query and key tensors.
@@ -348,10 +352,10 @@ class AdditiveRotaryEmbedding(torch.nn.Module):
             assert seqlen <= self.max_seqlen, f"seqlen ({seqlen}) must be <= max_seqlen ({self.max_seqlen})"
             pos = torch.arange(seqlen or self.max_seqlen, device=self.inv_freq.device)
 
-        def compute_embeddings(pos, phase, amplitude):
+        def compute_embeddings(pos, phase, weight):
             # pos: [seq_len]
             # phase: [n_heads, n_freqs]
-            # amplitude: [n_heads, n_freqs]
+            # weight: [n_heads, n_freqs]
             L = pos.size(0)
             H = phase.size(0)
             F = self.inv_freq.size(0)
@@ -364,14 +368,14 @@ class AdditiveRotaryEmbedding(torch.nn.Module):
             # [seq_len, n_heads, n_freqs]
             x = pos.float() * inv_freq + phase.view(1, H, F)
 
-            sin = x.sin() * amplitude.view(1, H, F)
-            cos = x.cos() * amplitude.view(1, H, F)
+            sin = x.sin() #* weight.view(1, H, F)
+            cos = x.cos() #* weight.view(1, H, F)
 
-            return torch.stack((cos, sin), dim=-1).view(L, H, F, 2)
+            return torch.stack((cos, sin), dim=-1).view(L, H, F, 2) * weight.view(1, H, F, 1)
 
         # Compute embeddings for queries and keys
-        q_emb = compute_embeddings(pos, self.q_phase, self.q_amplitude)
-        k_emb = compute_embeddings(pos, self.k_phase, self.k_amplitude)
+        q_emb = compute_embeddings(pos, self.q_phase, self.q_weight)
+        k_emb = compute_embeddings(pos, self.k_phase, self.k_weight)
 
         # Stack and reshape to match expected output format
         return q_emb, k_emb
@@ -379,8 +383,8 @@ class AdditiveRotaryEmbedding(torch.nn.Module):
     def reset_parameters(self):
         nn.init.zeros_(self.q_phase)
         nn.init.zeros_(self.k_phase)
-        nn.init.zeros_(self.phase)
-        nn.init.ones_(self.amplitude)
+        nn.init.ones_(self.q_weight)
+        nn.init.ones_(self.k_weight)
 
 
 class RMSNorm(nn.Module):
@@ -422,6 +426,7 @@ class Attention(nn.Module):
         n_heads: int,
         n_kv_heads: int,
         rope_theta: float,
+        rope_type: str,
     ):
         super().__init__()
 
@@ -620,6 +625,7 @@ class TransformerBlock(nn.Module):
         self.head_dim = args.head_dim or args.dim // args.n_heads
         self.n_heads = args.n_heads or args.dim // args.head_dim
         self.n_kv_heads = args.n_kv_heads or self.n_heads
+        self.rope_type = args.rope_type
 
         assert args.n_heads % self.n_kv_heads == 0
         assert args.dim % args.n_heads == 0
@@ -681,6 +687,8 @@ class TransformerBlock(nn.Module):
 
         self.feed_forward.reset_parameters(init_std, factor)
         self.ffn_norm.reset_parameters()
+        if hasattr(self, 'rope_embeddings'):
+            self.rope_embeddings.reset_parameters()
 
 
 class BaseTransformer(nn.Module):
