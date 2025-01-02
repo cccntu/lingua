@@ -51,13 +51,13 @@ checkpoint:
     every: 2500
     keep: 3
   eval:
-    every: 5000
+    every: 5000000000
     keep: -1
 
 logging:
   freq: 1
 
-async_eval_gpus: 8
+async_eval_gpus: 1
 eval:
   harness:
     tasks:

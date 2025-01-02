@@ -9,11 +9,11 @@ import torch.distributed
 import logging
 
 from torch.profiler.profiler import profile
-import xformers.profiler
-from xformers.profiler import (
-    MemSnapshotsProfiler,
-    PyTorchProfiler,
-)
+#import xformers.profiler
+#from xformers.profiler import (
+#    MemSnapshotsProfiler,
+#    PyTorchProfiler,
+#)
 
 from lingua.distributed import get_is_master
 
@@ -56,7 +56,7 @@ def perfetto_to_html(json_file, html_file):
         output_file.write(string.Template(tmpl).substitute(sub))
 
 
-class PyTorchProfilerWandb(PyTorchProfiler):
+class PyTorchProfilerWandb():#x:PyTorchProfiler):
     def __init__(self, main_profiler) -> None:
         self.main_profiler = main_profiler
         self.num_steps = 0
@@ -90,7 +90,8 @@ class PyTorchProfilerWandb(PyTorchProfiler):
             wandb.log({"profile_trace": wandb.Html(html_path)})
 
 
-class MemSnapshotsProfilerWandb(MemSnapshotsProfiler):
+class MemSnapshotsProfilerWandb():#MemSnapshotsProfiler):
+#class MemSnapshotsProfilerWandb(MemSnapshotsProfiler):
     def __exit__(self, exc_type, exc_val, exc_tb):
         super().__exit__(exc_type, exc_val, exc_tb)
         if get_is_master() and wandb.run is not None:
@@ -104,7 +105,8 @@ class MemSnapshotsProfilerWandb(MemSnapshotsProfiler):
 def maybe_run_profiler(dump_dir, module, config: ProfilerArgs):
     # get user defined profiler settings
 
-    if config.run:
+    #if config.run:
+    if False:
         trace_dir = os.path.join(dump_dir, config.trace_folder)
 
         logger.info(f"Profiling active.  Traces will be saved at {trace_dir}")
@@ -114,6 +116,7 @@ def maybe_run_profiler(dump_dir, module, config: ProfilerArgs):
         if torch.distributed.is_initialized():
             torch.distributed.barrier()
 
+        """
         with xformers.profiler.profile(
             output_dir=trace_dir,
             module=module,
@@ -131,6 +134,7 @@ def maybe_run_profiler(dump_dir, module, config: ProfilerArgs):
             ],
         ) as profiler:
             yield profiler
+        """
 
     else:
         torch_profiler = contextlib.nullcontext()

@@ -16,7 +16,7 @@ from torch.distributed.tensor.parallel import (
     parallelize_module,
 )
 
-from xformers.ops import fmha, AttentionBias
+#from xformers.ops import fmha, AttentionBias
 from lingua.transformer import (
     BaseTransformer,
     BaseTransformerArgs,
@@ -96,7 +96,7 @@ class LMTransformer(BaseTransformer):
         token_values: torch.Tensor,
         target: Optional[torch.Tensor] = None,
         tok_idx: Optional[torch.Tensor] = None,
-        mask: Optional[Union[BlockMask, AttentionBias, torch.Tensor, str]] = None,
+        mask: Optional[Union[BlockMask, "AttentionBias", torch.Tensor, str]] = None,
         attn_impl: str = "sdpa",
     ):
         bsz, seqlen = token_values.shape
