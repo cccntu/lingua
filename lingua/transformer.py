@@ -329,9 +329,11 @@ class AdditiveRotaryEmbedding(torch.nn.Module):
         self.q_weight = nn.Parameter(torch.ones(n_heads, n_freqs, dtype=torch.float32))
         self.k_weight = nn.Parameter(torch.ones(n_heads, n_freqs, dtype=torch.float32))
 
+        self.register_buffer('inv_freq', self.compute_inv_freq(), persistent=False)
         # Precompute inverse frequencies
-        inv_freq = 1.0 / (theta ** (torch.arange(0, n_freqs, dtype=torch.float32) / n_freqs))
-        self.register_buffer('inv_freq', inv_freq)
+    def compute_inv_freq(self):
+        inv_freq = 1.0 / (self.theta ** (torch.arange(0, self.head_dim // 2, dtype=torch.float32) / (self.head_dim // 2)))
+        return inv_freq
     def forward(self, seqlen: Optional[int] = None, tok_idx: Optional[torch.Tensor] = None):
         """
         Compute rotary embeddings for query and key tensors.
@@ -356,14 +358,15 @@ class AdditiveRotaryEmbedding(torch.nn.Module):
             # pos: [seq_len]
             # phase: [n_heads, n_freqs]
             # weight: [n_heads, n_freqs]
+            inv_freq = self.inv_freq
             L = pos.size(0)
             H = phase.size(0)
-            F = self.inv_freq.size(0)
+            F = inv_freq.size(0)
 
             # [seq_len, 1, 1]
             pos = pos.view(L, 1, 1)
             # [1, 1, n_freqs]
-            inv_freq = self.inv_freq.view(1, 1, F)
+            inv_freq = inv_freq.view(1, 1, F)
 
             # [seq_len, n_heads, n_freqs]
             x = pos.float() * inv_freq + phase.view(1, H, F)
@@ -385,6 +388,7 @@ class AdditiveRotaryEmbedding(torch.nn.Module):
         nn.init.zeros_(self.k_phase)
         nn.init.ones_(self.q_weight)
         nn.init.ones_(self.k_weight)
+        self.inv_freq[...] = self.compute_inv_freq().to(self.inv_freq.device)
 
 
 class RMSNorm(nn.Module):
