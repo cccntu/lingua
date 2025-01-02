@@ -378,7 +378,7 @@ class AdditiveRotaryEmbedding(torch.nn.Module):
 
     def reset_parameters(self):
         nn.init.zeros_(self.q_phase)
-        nn.init.zeros_(self.k_phase):
+        nn.init.zeros_(self.k_phase)
         nn.init.zeros_(self.phase)
         nn.init.ones_(self.amplitude)
 
