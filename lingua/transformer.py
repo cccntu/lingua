@@ -46,6 +46,7 @@ class BaseTransformerArgs:
     init_base_std: Optional[float] = None
     init_std_factor: str = "disabled"
     rope_type: str = "original" # can be additive
+    rope_inv_freq_learnable: bool = False
 
     max_seqlen: int = 1024
 
@@ -314,12 +315,13 @@ class RotaryEmbedding(torch.nn.Module):
             return self.freqs_cis[0:seqlen]
 
 class AdditiveRotaryEmbedding(torch.nn.Module):
-    def __init__(self, head_dim: int, n_heads: int, max_seqlen: int = 1024, theta: float = 10000.0):
+    def __init__(self, head_dim: int, n_heads: int, max_seqlen: int = 1024, theta: float = 10000.0, rope_inv_freq_learnable: bool = False):
         super().__init__()
         self.head_dim = head_dim
         self.n_heads = n_heads
         self.max_seqlen = max_seqlen
         self.theta = theta
+        self.rope_inv_freq_learnable = rope_inv_freq_learnable
         n_freqs = head_dim // 2
         assert n_freqs * 2 == head_dim, "head_dim must be divisible by 2"
 
@@ -329,7 +331,11 @@ class AdditiveRotaryEmbedding(torch.nn.Module):
         self.q_weight = nn.Parameter(torch.ones(n_heads, n_freqs, dtype=torch.float32))
         self.k_weight = nn.Parameter(torch.ones(n_heads, n_freqs, dtype=torch.float32))
 
-        self.register_buffer('inv_freq', self.compute_inv_freq(), persistent=False)
+        if not rope_inv_freq_learnable:
+            self.register_buffer('inv_freq', self.compute_inv_freq(), persistent=False)
+        else:
+            self.inv_freq = nn.Parameter(self.compute_inv_freq())
+        assert self.inv_freq.dtype == torch.float32, "inv_freq should be float32"
         # Precompute inverse frequencies
     def compute_inv_freq(self):
         inv_freq = 1.0 / (self.theta ** (torch.arange(0, self.head_dim // 2, dtype=torch.float32) / (self.head_dim // 2)))
@@ -388,7 +394,11 @@ class AdditiveRotaryEmbedding(torch.nn.Module):
         nn.init.zeros_(self.k_phase)
         nn.init.ones_(self.q_weight)
         nn.init.ones_(self.k_weight)
-        self.inv_freq[...] = self.compute_inv_freq().to(self.inv_freq.device)
+        if not self.rope_inv_freq_learnable:
+            self.inv_freq[...] = self.compute_inv_freq().to(self.inv_freq.device)
+        else:
+            # it's a Parameter, we can't do [...] =
+            self.inv_freq.data = self.compute_inv_freq().to(self.inv_freq.device)
 
 
 class RMSNorm(nn.Module):
@@ -430,7 +440,7 @@ class Attention(nn.Module):
         n_heads: int,
         n_kv_heads: int,
         rope_theta: float,
-        rope_type: str,
+        #rope_type: str, rope is defined out of the attention class, but the rotation will be passed in the forward function
     ):
         super().__init__()
 
@@ -488,7 +498,8 @@ class Attention(nn.Module):
         if rope_type == "original":
             xq, xk = apply_rotary_emb(xq, xk, 1, freq_cis[0:seq_len])
         elif rope_type == "additive":
-            xq, xk = apply_additive_rotary_emb(xq, xk, 1, freq_cis[0:seq_len])
+            # freq_cis is a tuple of (freq_cis, inv_freq_cis)
+            xq, xk = apply_additive_rotary_emb(xq, xk, 1, freq_cis)
         else:
             raise ValueError(f"Unsupported rotary type: {rope_type}")
 
@@ -640,6 +651,7 @@ class TransformerBlock(nn.Module):
                 n_heads=self.n_heads,
                 max_seqlen=args.max_seqlen,
                 theta=args.rope_theta,
+                rope_inv_freq_learnable=args.rope_inv_freq_learnable,
             )
 
         self.attention = Attention(
