@@ -7,6 +7,7 @@ from typing import Optional, Union, Tuple
 import torch
 from torch import nn
 from torch.nn import functional as F
+
 #from xformers.ops import fmha, AttentionBias
 from torch.nn.attention.flex_attention import (
     BlockMask,
@@ -397,9 +398,15 @@ class AdditiveRotaryEmbedding(torch.nn.Module):
         if not self.rope_inv_freq_learnable:
             self.inv_freq[...] = self.compute_inv_freq().to(self.inv_freq.device)
         else:
-            # it's a Parameter, we can't do [...] =
-            self.inv_freq.data = self.compute_inv_freq().to(self.inv_freq.device)
-
+            new_freq = self.compute_inv_freq()
+            if isinstance(self.inv_freq, torch.distributed._tensor.DTensor):
+                from torch.distributed._tensor import DTensor
+                device_mesh = self.inv_freq._spec.mesh
+                new_freq = DTensor.from_local(new_freq.to(self.inv_freq.device),
+                                            device_mesh,
+                                            self.inv_freq._spec.placements)
+            self.inv_freq.data.copy_(new_freq)
+            print(f'{self.inv_freq=}')
 
 class RMSNorm(nn.Module):
     """
