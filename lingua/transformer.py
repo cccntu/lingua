@@ -660,7 +660,7 @@ class TransformerBlock(nn.Module):
             n_heads=self.n_heads,
             n_kv_heads=self.n_kv_heads,
             rope_theta=args.rope_theta,
-            rope_type=args.rope_type,
+            #rope_type=args.rope_type,
         )
         self.feed_forward = FeedForward(
             dim=args.dim,
