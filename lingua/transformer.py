@@ -367,7 +367,7 @@ class AdditiveRotaryEmbedding(torch.nn.Module):
             # weight: [n_heads, n_freqs]
             inv_freq = self.inv_freq
             if self.rope_inv_freq_learnable:
-                inv_freq = F.relu(inv_freq)
+                inv_freq = torch.nn.functional.relu(inv_freq)
             L = pos.size(0)
             H = phase.size(0)
             F = inv_freq.size(0)
