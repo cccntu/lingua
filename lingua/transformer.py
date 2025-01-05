@@ -637,7 +637,6 @@ class SimpleMLA(nn.Module):
             bias=False,
         )
 
-    @torch.compile(mode='max-autotune-no-cudagraphs')
     def forward(
         self,
         x: torch.Tensor,
