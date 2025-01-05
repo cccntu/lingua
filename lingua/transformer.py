@@ -726,6 +726,7 @@ class SimpleMLA(nn.Module):
                 a=-3 * init_std,
                 b=3 * init_std,
             )
+            self.q_norm.reset_parameters()
 
         # KV projections
         nn.init.trunc_normal_(
@@ -742,6 +743,7 @@ class SimpleMLA(nn.Module):
             a=-3 * init_std,
             b=3 * init_std,
         )
+        self.kv_norm.reset_parameters()
 
         # Output projection
         nn.init.trunc_normal_(
