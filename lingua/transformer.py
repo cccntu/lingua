@@ -512,6 +512,8 @@ class Attention(nn.Module):
         elif rope_type == "additive":
             # freq_cis is a tuple of (freq_cis, inv_freq_cis)
             xq, xk = apply_additive_rotary_emb(xq, xk, 1, freq_cis)
+        elif rope_type == "none":
+            pass
         else:
             raise ValueError(f"Unsupported rotary type: {rope_type}")
 
@@ -669,6 +671,9 @@ class SimpleMLA(nn.Module):
             q, k = apply_rotary_emb(q, k, 1, freq_cis[0:seqlen])
         elif rope_type == "additive":
             q, k = apply_additive_rotary_emb(q, k, 1, freq_cis)
+        elif rope_type == "none":
+            assert freq_cis is None, f"rope_type=none should not have freq_cis, but got {type(freq_cis)=}"
+            pass
         else:
             raise ValueError(f"Unsupported rotary type: {rope_type}")
 
@@ -845,7 +850,7 @@ class TransformerBlock(nn.Module):
                 #rope_type=args.rope_type,
             )
         elif args.use_mla == 'simple':
-            assert args.rope_type == 'additive', "Simple MLA should be used with Additive RoPE"
+            assert args.rope_type in ['additive', 'none'], "Simple MLA should be used with Additive RoPE"
             self.attention = SimpleMLA(
                 dim=args.dim,
                 head_dim=self.head_dim,
