@@ -512,7 +512,7 @@ class Attention(nn.Module):
         if rope_type == "original":
             xq, xk = apply_rotary_emb(xq, xk, 1, freq_cis[0:seq_len])
         elif rope_type == "additive":
-            # freq_cis is a tuple of (freq_cis, inv_freq_cis)
+            # freq_cis is a tuple of freq_cis for q and k
             xq, xk = apply_additive_rotary_emb(xq, xk, 1, freq_cis)
         elif rope_type == "none":
             pass
