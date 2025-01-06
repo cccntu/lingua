@@ -51,6 +51,12 @@ class BaseTransformerArgs:
 
     max_seqlen: int = 1024
 
+    use_mla: str = '' # use MLA w/o decoupled RoPE, compatible with Additive RoPE
+    q_lora_rank: int = 1536 # from DS-V2 (3x kv lora rank)
+    kv_lora_rank: int = 512 # from DS-V2 (4x head dim)
+    # MLA uses 3.2x the num_head
+    # DS-V2 hsa hidden size 5120, and 128 heads
+    # remember to set a larger n_kv_heads for MLA
 
 def cross_entropy(pred, target, **kwargs):
     return F.nll_loss(
@@ -440,7 +446,6 @@ class RMSNorm(nn.Module):
     def reset_parameters(self):
         torch.nn.init.ones_(self.weight)  # type: ignore
 
-
 class Attention(nn.Module):
     def __init__(
         self,
@@ -509,6 +514,8 @@ class Attention(nn.Module):
         elif rope_type == "additive":
             # freq_cis is a tuple of (freq_cis, inv_freq_cis)
             xq, xk = apply_additive_rotary_emb(xq, xk, 1, freq_cis)
+        elif rope_type == "none":
+            pass
         else:
             raise ValueError(f"Unsupported rotary type: {rope_type}")
 
@@ -573,7 +580,181 @@ class Attention(nn.Module):
             b=3 * init_std,
         )
 
+class SimpleMLA(nn.Module):
+    """
+    A simplified version of the MLA module that does not have the decoupled RoPE
+    Instead, it is meant to be used with Additive RoPE.
+    """
+    def __init__(
+        self,
+        dim: int,
+        head_dim: int,
+        n_heads: int,
+        n_kv_heads: int,
+        q_lora_rank: int = 0,
+        kv_lora_rank: int = 0,
+    ):
+        super().__init__()
 
+        self.dim = dim
+        self.head_dim = head_dim
+        self.n_heads = n_heads
+        self.n_kv_heads = n_kv_heads
+        self.q_lora_rank = q_lora_rank
+        self.kv_lora_rank = kv_lora_rank
+
+        # Query projection with optional LoRA
+        if self.q_lora_rank == 0:
+            self.wq = nn.Linear(
+                dim,
+                n_heads * head_dim,
+                bias=False,
+            )
+        else:
+            self.wq_a = nn.Linear(dim, self.q_lora_rank, bias=False)
+            self.q_norm = RMSNorm(self.q_lora_rank)
+            self.wq_b = nn.Linear(
+                self.q_lora_rank,
+                n_heads * head_dim,
+                bias=False,
+            )
+
+        # Key-Value projection with LoRA
+        self.wkv_a = nn.Linear(
+            dim,
+            kv_lora_rank,
+            bias=False,
+        )
+        self.kv_norm = RMSNorm(kv_lora_rank)
+        self.wkv_b = nn.Linear(
+            kv_lora_rank,
+            n_kv_heads * (head_dim + head_dim),  # for both K and V
+            bias=False,
+        )
+
+        # Output projection
+        self.wo = nn.Linear(
+            n_heads * head_dim,
+            dim,
+            bias=False,
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        freq_cis: torch.Tensor,
+        tok_idx: Optional[torch.Tensor] = None,
+        mask: Optional[Union[BlockMask, "AttentionBias", str]] = None,
+        attn_impl: str = "sdpa",
+        rope_type: str = "original",
+    ) -> torch.Tensor:
+        bsz, seqlen, _ = x.shape
+
+        # Query projection
+        if self.q_lora_rank == 0:
+            q = self.wq(x)
+        else:
+            q = self.wq_b(self.q_norm(self.wq_a(x)))
+
+        # Reshape query
+        q = q.view(bsz, seqlen, self.n_heads, self.head_dim)
+
+        # Key-Value projection
+        kv = self.wkv_a(x)
+        kv = self.kv_norm(kv)
+        # Project to keys and values using linear projection
+        kv_out = self.wkv_b(kv)
+        # Split into keys and values and reshape
+        kv_out = kv_out.view(bsz, seqlen, self.n_kv_heads, 2, self.head_dim)
+        k, v = kv_out.unbind(dim=3)
+
+        # Apply rotary embeddings
+        if rope_type == "original":
+            q, k = apply_rotary_emb(q, k, 1, freq_cis[0:seqlen])
+        elif rope_type == "additive":
+            q, k = apply_additive_rotary_emb(q, k, 1, freq_cis)
+        elif rope_type == "none":
+            assert freq_cis is None, f"rope_type=none should not have freq_cis, but got {type(freq_cis)=}"
+            pass
+        else:
+            raise ValueError(f"Unsupported rotary type: {rope_type}")
+
+        # Repeat KV heads if needed
+        if self.n_heads > self.n_kv_heads:
+            k = repeat_kv(k, self.n_heads // self.n_kv_heads, dim=2)
+            v = repeat_kv(v, self.n_heads // self.n_kv_heads, dim=2)
+
+        # Use scaled dot product attention with SDPA
+        q, k, v = map(lambda e: e.transpose(1, 2), (q, k, v))
+        is_causal = isinstance(mask, str) and mask == "causal"
+        attn_mask = None if is_causal else mask
+
+        output = F.scaled_dot_product_attention(
+            q, k, v,
+            attn_mask=attn_mask,
+            is_causal=is_causal,
+            scale=None,
+        )
+
+        # Restore shape and project to output
+        output = output.transpose(1, 2)
+        output = self.wo(output.reshape(bsz, seqlen, -1))
+        return output
+
+    def reset_parameters(self, init_std=None, factor=1.0):
+        init_std = init_std or (self.dim ** (-0.5))
+
+        # Query projections
+        if self.q_lora_rank == 0:
+            nn.init.trunc_normal_(
+                self.wq.weight,
+                mean=0.0,
+                std=init_std,
+                a=-3 * init_std,
+                b=3 * init_std,
+            )
+        else:
+            nn.init.trunc_normal_(
+                self.wq_a.weight,
+                mean=0.0,
+                std=init_std,
+                a=-3 * init_std,
+                b=3 * init_std,
+            )
+            nn.init.trunc_normal_(
+                self.wq_b.weight,
+                mean=0.0,
+                std=init_std,
+                a=-3 * init_std,
+                b=3 * init_std,
+            )
+            self.q_norm.reset_parameters()
+
+        # KV projections
+        nn.init.trunc_normal_(
+            self.wkv_a.weight,
+            mean=0.0,
+            std=init_std,
+            a=-3 * init_std,
+            b=3 * init_std,
+        )
+        nn.init.trunc_normal_(
+            self.wkv_b.weight,
+            mean=0.0,
+            std=init_std,
+            a=-3 * init_std,
+            b=3 * init_std,
+        )
+        self.kv_norm.reset_parameters()
+
+        # Output projection
+        nn.init.trunc_normal_(
+            self.wo.weight,
+            mean=0.0,
+            std=init_std / factor,
+            a=-3 * init_std,
+            b=3 * init_std,
+        )
 class FeedForward(nn.Module):
     def __init__(
         self,
@@ -652,7 +833,8 @@ class TransformerBlock(nn.Module):
         self.rope_type = args.rope_type
 
         assert args.n_heads % self.n_kv_heads == 0
-        assert args.dim % args.n_heads == 0
+        if not args.use_mla:
+            assert args.dim % args.n_heads == 0
 
         if args.rope_type == "additive":
             self.rope_embeddings = AdditiveRotaryEmbedding(
@@ -662,15 +844,28 @@ class TransformerBlock(nn.Module):
                 theta=args.rope_theta,
                 rope_inv_freq_learnable=args.rope_inv_freq_learnable,
             )
+        if not args.use_mla:
+            self.attention = Attention(
+                dim=args.dim,
+                head_dim=self.head_dim,
+                n_heads=self.n_heads,
+                n_kv_heads=self.n_kv_heads,
+                rope_theta=args.rope_theta,
+                #rope_type=args.rope_type,
+            )
+        elif args.use_mla == 'simple':
+            assert args.rope_type in ['additive', 'none'], "Simple MLA should be used with Additive RoPE"
+            self.attention = SimpleMLA(
+                dim=args.dim,
+                head_dim=self.head_dim,
+                n_heads=self.n_heads,
+                n_kv_heads=self.n_kv_heads,
+                q_lora_rank=args.q_lora_rank,
+                kv_lora_rank=args.kv_lora_rank,
+            )
+        else:
+            raise ValueError(f"Invalid use_mla: {args.use_mla}")
 
-        self.attention = Attention(
-            dim=args.dim,
-            head_dim=self.head_dim,
-            n_heads=self.n_heads,
-            n_kv_heads=self.n_kv_heads,
-            rope_theta=args.rope_theta,
-            #rope_type=args.rope_type,
-        )
         self.feed_forward = FeedForward(
             dim=args.dim,
             hidden_dim=4 * args.dim,
