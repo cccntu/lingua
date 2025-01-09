@@ -131,20 +131,20 @@ def reshape_for_broadcast(freqs_cis: torch.Tensor, x: torch.Tensor, seq_dim: int
         shape = [
             d if i == seq_dim or i == ndim - 3 else 1 for i, d in enumerate(x.shape[:-2])
         ] + [2, 2]
-    else:
-        assert freqs_cis.shape == (
-            x.shape[seq_dim],
-            x.shape[-3],
-            x.shape[-2],
-            2,
-        ), f"freqs_cis vs x: {(freqs_cis.shape, x.shape)}"
-        #shape = [
-        #    d if i == seq_dim or i == ndim - 3 else 1 for i, d in enumerate(x.shape[:-1])
-        #] + [2]
-        # impl note:
-        # original rope is same across head
-        # additive rope is different for each head and both q and k
-
+        return freqs_cis.view(*shape)
+    #else:
+    assert freqs_cis.shape == (
+        x.shape[seq_dim],
+        x.shape[-3],
+        x.shape[-2],
+        2,
+    ), f"freqs_cis vs x: {(freqs_cis.shape, x.shape)}"
+    #shape = [
+    #    d if i == seq_dim or i == ndim - 3 else 1 for i, d in enumerate(x.shape[:-1])
+    #] + [2]
+    # impl note:
+    # original rope is same across head
+    # additive rope is different for each head and both q and k
     return freqs_cis.view(*x.shape[1:])
 
 
