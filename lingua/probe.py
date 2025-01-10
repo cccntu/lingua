@@ -35,7 +35,7 @@ from torch.utils.module_tracker import ModuleTracker
 from torch.fx.operator_schemas import normalize_function
 from torch.nn.attention import sdpa_kernel, SDPBackend
 
-#from xformers.ops import fmha
+from xformers.ops import fmha
 
 
 @torch.library.custom_op("torchprobe::log", mutates_args=(), device_types=None)
@@ -446,9 +446,9 @@ class AutoProbeD(TorchDispatchMode):
         ]:
             _, kwargs = normalize_function(func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True)
             _compute_attn_stats_sdpa(self, path, **kwargs)
-        #elif func._overloadpacket == fmha.flash.FwOp.OPERATOR:
-        #    _, kwargs = normalize_function(func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True)
-        #    _compute_attn_stats_flash(self, path, **kwargs)
+        elif func._overloadpacket == fmha.flash.FwOp.OPERATOR:
+            _, kwargs = normalize_function(func, args=args, kwargs=kwargs, normalize_to_only_use_kwargs=True)
+            _compute_attn_stats_flash(self, path, **kwargs)
         elif func._overloadpacket == torch.ops.torchprobe.log:
             uid = args[2]
             path = self.uid_to_path.setdefault(uid, path)

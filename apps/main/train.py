@@ -18,7 +18,7 @@ from omegaconf import OmegaConf
 import torch
 import torch.distributed
 import torch.nn.functional as F
-#import xformers.profiler
+import xformers.profiler
 from torch.optim import lr_scheduler
 from torch.distributed.checkpoint.stateful import Stateful
 from torch.distributed._tensor import DTensor
@@ -446,8 +446,7 @@ def train(args: TrainArgs):
 
             # if profiler is active
             if torch_profiler:
-                #xformers.profiler.step()
-                pass
+                xformers.profiler.step()
 
             # log metrics
             if every_n_steps(
