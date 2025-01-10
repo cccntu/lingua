@@ -684,20 +684,26 @@ class SimpleMLA(nn.Module):
             k = repeat_kv(k, self.n_heads // self.n_kv_heads, dim=2)
             v = repeat_kv(v, self.n_heads // self.n_kv_heads, dim=2)
 
-        # Use scaled dot product attention with SDPA
+        # Use scaled dot product attention with SDPA or flex_attention
         q, k, v = map(lambda e: e.transpose(1, 2), (q, k, v))
         is_causal = isinstance(mask, str) and mask == "causal"
         attn_mask = None if is_causal else mask
 
-        output = F.scaled_dot_product_attention(
-            q, k, v,
-            attn_mask=attn_mask,
-            is_causal=is_causal,
-            scale=None,
-        )
+        if attn_impl == "flex_attention":
+            assert mask is None or isinstance(mask, BlockMask)
+            print(f'simple mla flex_attention: {q.shape=} {k.shape=} {v.shape=}')
+            output = flex_attention_comp(q, k, v, block_mask=mask)
+            output = output.transpose(1, 2).contiguous()  # B H S D -> B S H D
+        else:
+            output = F.scaled_dot_product_attention(
+                q, k, v,
+                attn_mask=attn_mask,
+                is_causal=is_causal,
+                scale=None,
+            )
+            output = output.transpose(1, 2)  # B H S D -> B S H D
 
         # Restore shape and project to output
-        output = output.transpose(1, 2)
         output = self.wo(output.reshape(bsz, seqlen, -1))
         return output
 
@@ -827,6 +833,8 @@ class TransformerBlock(nn.Module):
         assert (args.head_dim is not None) or (
             args.n_heads is not None
         ), "Should specify at least head_dim or n_heads"
+        if args.use_mla == 'simple':
+            assert args.head_dim is not None, "Simple MLA requires head_dim to be specified, but got None"
         self.head_dim = args.head_dim or args.dim // args.n_heads
         self.n_heads = args.n_heads or args.dim // args.head_dim
         self.n_kv_heads = args.n_kv_heads or self.n_heads
