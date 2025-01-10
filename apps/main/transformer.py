@@ -48,10 +48,10 @@ def attention_flops_per_token(n_layers, seq_len, dim, causal):
 
 
 def get_num_flop_per_token(
-    num_non_embed_params: int, n_layers: int, dim: int, seq_len: int
+    num_non_embed_params: int, n_layers: int, dim: int, seq_len: int, attn_dim: int = None
 ) -> int:
     return 6 * num_non_embed_params + attention_flops_per_token(
-        n_layers, seq_len, dim, True
+        n_layers, seq_len, attn_dim or dim, True
     )
 
 

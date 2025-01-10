@@ -471,12 +471,14 @@ def train(args: TrainArgs):
                 # This is an estimate and the correct values may change
                 # if you change the architecture
                 # Use xformer's analyze profile trace to get actual measurement
+                attn_dim = args.model.head_dim * args.model.n_heads if args.model.use_mla else args.model.dim
                 FLOPS = (
                     get_num_flop_per_token(
                         model_param_count - args.model.vocab_size * args.model.dim,
                         args.model.n_layers,
                         args.model.dim,
                         args.data.seq_len,
+                        attn_dim=attn_dim,
                     )
                     * wps
                 )
