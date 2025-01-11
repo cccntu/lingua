@@ -600,6 +600,7 @@ class SimpleMLA(nn.Module):
         self.n_kv_heads = n_kv_heads
         self.q_lora_rank = q_lora_rank
         self.kv_lora_rank = kv_lora_rank
+        self.heads_per_group = self.n_heads // self.n_kv_heads
 
         # Query projection with optional LoRA
         if self.q_lora_rank == 0:
@@ -653,6 +654,7 @@ class SimpleMLA(nn.Module):
             q = self.wq(x)
         else:
             q = self.wq_b(self.q_norm(self.wq_a(x)))
+        output_shape = q.shape
 
         # Reshape query
         q = q.view(bsz, seqlen, self.n_heads, self.head_dim)
@@ -677,32 +679,38 @@ class SimpleMLA(nn.Module):
         else:
             raise ValueError(f"Unsupported rotary type: {rope_type}")
 
+        # This condition helps us be easily compatible
+        # with inference by adding a pluggable KVCache
+        if hasattr(self, "kv_cache"):
+            k, v = self.kv_cache.update(k, v, tok_idx)
+            seqlen = k.size(1)  # Update seqlen after using KV cache
+
         # Repeat KV heads if needed
         if self.n_heads > self.n_kv_heads:
-            k = repeat_kv(k, self.n_heads // self.n_kv_heads, dim=2)
-            v = repeat_kv(v, self.n_heads // self.n_kv_heads, dim=2)
+            k = repeat_kv(k, self.heads_per_group, dim=2)
+            v = repeat_kv(v, self.heads_per_group, dim=2)
 
         # Use scaled dot product attention with SDPA or flex_attention
         q, k, v = map(lambda e: e.transpose(1, 2), (q, k, v))
-        is_causal = isinstance(mask, str) and mask == "causal"
-        attn_mask = None if is_causal else mask
 
         if attn_impl == "flex_attention":
             assert mask is None or isinstance(mask, BlockMask)
-            print(f'simple mla flex_attention: {q.shape=} {k.shape=} {v.shape=}')
             output = flex_attention_comp(q, k, v, block_mask=mask)
             output = output.transpose(1, 2).contiguous()  # B H S D -> B S H D
         else:
+            assert mask is None or isinstance(mask, (str, torch.Tensor))
+            is_causal = (mask == "causal") if isinstance(mask, str) else False
+            attn_mask = mask if isinstance(mask, torch.Tensor) else None
             output = F.scaled_dot_product_attention(
                 q, k, v,
-                attn_mask=attn_mask,
                 is_causal=is_causal,
-                scale=None,
+                attn_mask=attn_mask,
             )
-            output = output.transpose(1, 2)  # B H S D -> B S H D
+            output = output.transpose(1, 2).contiguous()  # B H S D -> B S H D
+
 
         # Restore shape and project to output
-        output = self.wo(output.reshape(bsz, seqlen, -1))
+        output = self.wo(output.reshape(output_shape))
         return output
 
     def reset_parameters(self, init_std=None, factor=1.0):

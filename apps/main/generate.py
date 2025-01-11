@@ -19,6 +19,7 @@ from lingua.checkpoint import CONSOLIDATE_NAME
 from lingua.tokenizer import Tokenizer, build_tokenizer
 from lingua.transformer import (
     Attention,
+    SimpleMLA,
     causal_mask,
     generate_doc_mask_mod,
     lengths_to_local_ids,
@@ -190,7 +191,7 @@ class PackedCausalTransformerGenerator:
 
     def clear_cache(self, offset):
         for module in self.model.modules():
-            if isinstance(module, Attention):
+            if isinstance(module, (Attention, SimpleMLA)):
                 if not hasattr(module, "kv_cache"):
                     module.kv_cache = KVCache(
                         1,
@@ -273,7 +274,7 @@ class PackedCausalTransformerGenerator:
     def setup_generation(self, lengths):
         # KV Cache offset is set to the start of the padded documents
         for module in self.model.modules():
-            if isinstance(module, Attention):
+            if isinstance(module, (Attention, SimpleMLA)):
                 module.kv_cache.offset = self.padded_doc_start
         # The token ids during generations correspond to the lengths of each doc
         # current_tok_id will be incremented during generation
