@@ -20,6 +20,7 @@ from lingua.tokenizer import Tokenizer, build_tokenizer
 from lingua.transformer import (
     Attention,
     SimpleMLA,
+    KVCacheMLA,
     causal_mask,
     generate_doc_mask_mod,
     lengths_to_local_ids,
@@ -173,12 +174,16 @@ class PackedCausalTransformerGenerator:
         self.device = cfg.device
 
         # Compile if necessary
+        print(f'cfg.reduce_generation_overhead: {cfg.reduce_generation_overhead}')
+
+        """
         self.prefill = torch.compile(self.prefill, disable=not cfg.compile_prefilling)
         self.generate_next_token = torch.compile(
             self.generate_next_token,
             mode="reduce-overhead",
             disable=not cfg.reduce_generation_overhead,
         )
+        """
 
         self.show_progress = cfg.show_progress
         self.dtype = dict(fp32=torch.float32, bf16=torch.bfloat16)[cfg.dtype]
@@ -202,6 +207,17 @@ class PackedCausalTransformerGenerator:
                         self.device,
                     )
                 module.kv_cache.offset = offset
+            if isinstance(module, SimpleMLA):
+                if not hasattr(module, "kv_cache_mla"):
+                    module.kv_cache_mla = KVCacheMLA(
+                        1,
+                        self.max_tokens,
+                        module.kv_lora_rank,
+                        self.dtype,
+                        self.device,
+                    )
+                module.kv_cache_mla.offset = offset
+                module.mla_inference_mode()
 
     @torch.compiler.disable
     def setup_prefilling(self, lengths: torch.Tensor):
@@ -276,6 +292,8 @@ class PackedCausalTransformerGenerator:
         for module in self.model.modules():
             if isinstance(module, (Attention, SimpleMLA)):
                 module.kv_cache.offset = self.padded_doc_start
+            if isinstance(module, (SimpleMLA)):
+                module.kv_cache_mla.offset = self.padded_doc_start
         # The token ids during generations correspond to the lengths of each doc
         # current_tok_id will be incremented during generation
         self.current_tok_id = lengths.clone()
@@ -355,6 +373,7 @@ class PackedCausalTransformerGenerator:
             # Prefilling cache
             prompt_logits = self.prefill(packed_batch.unsqueeze(0), lengths)
             # Selecting last token in each prompt
+            print(f'{self.temperature=}')
             all_tokens = sample_tokens(
                 prompt_logits, self.temperature, self.top_p, self.top_k
             )

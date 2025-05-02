@@ -16,7 +16,7 @@ from torch.nn.attention.flex_attention import (
 
 from lingua import probe
 
-flex_attention_comp = torch.compile(flex_attention)
+flex_attention_comp = torch.compile(flex_attention, disable=True)
 
 
 class InitStdFactor(Enum):
@@ -578,6 +578,27 @@ class Attention(nn.Module):
             b=3 * init_std,
         )
 
+class KVCacheMLA(nn.Module):
+    """
+    KV Cache for MLA that only caches the low-rank tensor shared across all heads.
+    This is more memory efficient than regular KV cache since it leverages MLA's low-rank structure.
+    """
+    def __init__(self, bsz, seqlen, kv_lora_rank, dtype, device):
+        super().__init__()
+        shape = (bsz, seqlen, kv_lora_rank)
+        self.register_buffer("kv_cache", torch.zeros(shape, dtype=dtype, device=device))
+        self.offset = 0
+
+    def reset(self):
+        self.kv_cache.zero_()
+        self.offset = 0
+
+    def update(self, kv_val, tok_idx):
+        # kv_val: [B, S, R] where R is the low-rank dimension
+        # tok_idx: [B] indices where to write in the cache
+        self.kv_cache.index_copy_(1, self.offset + tok_idx, kv_val)
+        return self.kv_cache
+
 class SimpleMLA(nn.Module):
     """
     A simplified version of the MLA module that does not have the decoupled RoPE
@@ -638,6 +659,108 @@ class SimpleMLA(nn.Module):
             bias=False,
         )
 
+    # Shape annotations:
+    # B = batch size
+    # S = sequence length
+    # H = num heads
+    # D = head dim
+    # C = compression dim (kv_lora_rank)
+    # Q = q_lora_rank
+
+    def mla_inference_mode(self):
+        """Prepare for inference by absorbing matrices"""
+        if self.q_lora_rank == 0:
+            return
+        with torch.no_grad():
+            # Original shapes:
+            # wq_a: dim -> Q
+            # q_norm: Q -> Q
+            # wq_b: Q -> (H * D)
+            # wkv_a: dim -> C
+            # kv_norm: C -> C
+            # wkv_b: C -> (n_kv_heads * 2 * D)
+            # wo: (H * D) -> dim
+
+            # 1&2. Calculate pseudo-inverses
+
+            # linear.weight = (out_features, in_features)
+            q_up = self.wq_b.weight # [(H * D), dim]
+            self.q_up_pinv = torch.pinverse(q_up.float())  # [dim, (H * D)]
+            return
+
+            # Split KV projection into K and V parts
+            kv_up = self.wkv_b.weight  #  (n_kv_heads * 2 * D), C
+            k_up, v_up = kv_up.view(self.n_kv_heads * self.head_dim, 2, -1).chunk(2, dim=1)
+            print(f'{k_up.shape=} {v_up.shape=}, {self.n_kv_heads=} {self.head_dim=} {self.kv_lora_rank=}')
+            k_up = k_up.view(self.n_kv_heads * self.head_dim, -1)
+            v_up = v_up.view(self.n_kv_heads * self.head_dim, -1)
+            assert k_up.shape == v_up.shape == (self.n_kv_heads * self.head_dim, self.kv_lora_rank)
+
+            self.k_pinv = torch.pinverse(k_up.float())  # C, (n_kv_heads * D)
+
+            # 3. Absorb k_up into q_up
+            # q_up @ q => dim = n_heads * D
+            # k_up @ c => dim = n_kv_heads * D
+            assert self.n_heads == self.n_kv_heads, "current implementation only supports n_heads == n_kv_heads, it's possible to change this"
+            # c: C x 1
+            # k_up: (n_kv_heads * D) x C
+            # q_up: (n_heads * D) x dim
+            # k_up.T @ q_up: C x dim
+            #--------------
+            # q_up_head1 = q_up[0:head_dim, :]
+            # k_up_head1 = k_up[0:head_dim, :]
+            # q: [head_dim, 1]
+
+            # q_head1 = q_up_head1 @ q : [head_dim, 1]
+            # k_head1 = k_up_head1 @ c : [head_dim, 1]
+            # q_head1.T @ k_head1: [1]
+            # (q_up_head1 @ q).T @ (k_up_head1 @ c)
+            # = (q.T @ q_up_head1.T) @ (k_up_head1 @ c) = q.T @ (q_up_head1.T @ k_up_head1) @ c
+            # q_up_head1.T @ k_up_head1: [head_dim, q_dim].T x [head_dim, C] = [q_dim, C]
+
+
+
+            self.q_absorbed = torch.einsum("hdq,hdc->hcq", q_up.view(self.n_heads, self.head_dim, -1), k_up.view(self.n_kv_heads, self.head_dim, -1)).reshape(
+                 (self.n_heads*self.kv_lora_rank, self.q_lora_rank)
+             ).contiguous()
+            #print(f'{self.q_absorbed.shape=}')
+            #print(f'{self.n_heads=} {self.head_dim=} {self.kv_lora_rank=} {self.q_lora_rank=}')
+            # q_absorbed: [H*C, Q]
+
+            # -> n heads, each dim is C
+            # use c as V
+            # attn output shape is n_heads * C
+
+            # each head has a different output projection
+            # 4. Absorb v_up into output projection
+            # Original: v_up: dim -> (n_kv_heads * D), wo: (H * D) -> dim
+            #
+            # wo: [dim, H*D]
+            # wo_head1: [hidden_dim, head_dim]
+            # v_head1: [head_dim] = v_up_head1 @ c : [head_dim, C] @ [C, 1] = [head_dim, 1]
+            # v_up_head1: [head_dim, C]
+            # out =   wo_head1 @ (score_head1 * v_head1 )  + wo_head2 @ (score_head2 * v_head2) ...
+            # = score_head1 * wo_head1 @  v_head1 + score_head2 * wo_head2 @ v_head2 + ...
+            # (wo_head1 @ v_head1) = wo_head1 @ v_head1 = wo_head1 @ v_up_head1 @ c
+            # wo_head1 @ v_up_head1: [hidden_dim, head_dim] @ [head_dim, C] = [hidden_dim, C]
+
+            # wo_absorbed: [H*hidden_dim, C]
+            self.wo_absorbed = torch.einsum("Dhd,hdc->Dhc", self.wo.weight.view(self.dim, self.n_heads, -1), v_up.view(self.n_kv_heads, self.head_dim, -1)).reshape(
+                (self.dim, self.n_heads*self.kv_lora_rank)
+            ).contiguous()
+
+            # Store necessary dimensions for reshaping
+            self.c_dim = self.kv_lora_rank
+
+            # Clean up original modules
+            del self.wq_b
+            del self.wkv_b
+            del self.wo
+            self.do_full_mla_inference=True
+
+        return self
+
+    @torch.compiler.disable
     def forward(
         self,
         x: torch.Tensor,
@@ -645,23 +768,126 @@ class SimpleMLA(nn.Module):
         tok_idx: Optional[torch.Tensor] = None,
         mask: Optional[Union[BlockMask, "AttentionBias", str]] = None,
         attn_impl: str = "sdpa",
-        rope_type: str = "original",
+        rope_type: str = "additive",
     ) -> torch.Tensor:
+        bsz, seqlen, _ = x.shape
+
+        if hasattr(self, "do_full_mla_inference") and self.do_full_mla_inference:
+            with torch.cuda.amp.autocast(dtype=x.dtype), torch.no_grad():
+                # We're in inference mode with absorbed matrices
+                # 0. Calculate low rank q and kv
+                q = self.q_norm(self.wq_a(x))  # [B, S, H*D]
+
+                kv = self.kv_norm(self.wkv_a(x))  # [B, S, C]
+
+                # 1&2. Down project additive RoPE and apply
+                # Assuming freq_cis has shape [S, H, D] for additive
+                # torch.stack((cos, sin), dim=-1).view(L, H, F, 2) * weight.view(1, H, F, 1)
+                # q_emb: [L, H, F, 2]
+                q_emb, k_emb = freq_cis
+                q_rope = self.q_pinv @ q_emb.reshape(q_emb.shape[0], -1).T  # [C, S]
+                k_rope = self.k_pinv @ k_emb.reshape(k_emb.shape[0], -1).T  # [C, S]
+
+
+                # Apply down-projected RoPE
+                q = q + q_rope.T.unsqueeze(0)  # [B, S, Q]
+                kv = kv + k_rope.T.unsqueeze(0)  # [B, S, C]
+
+                q_seqlen = seqlen
+                if hasattr(self, "kv_cache"):
+                    # For MLA, we cache the low-rank tensor before the final projection
+                    print(f'before kv_cache update: {kv.shape=}')
+                    kv = self.kv_cache.update(kv, tok_idx)
+                    print(f'after kv_cache update: {kv.shape=}')
+                    seqlen = kv.size(1)  # Update seqlen after using KV cache
+
+                # 3. Run merged q projection
+                q = F.linear(q, self.q_absorbed) # [B, S, H*C]
+                # 4. Run attention
+                # Reshape for attention
+                q = q.view(bsz, q_seqlen, self.n_heads, -1).transpose(1, 2)  # [B, H, S, C]
+                # here only single head, in latent kv
+                kv = kv.view(bsz, seqlen, 1, -1).transpose(1, 2)  # [B, 1, S, C]
+                print(f'just before attention: {q.shape=} {kv.shape=}')
+
+                if attn_impl == "flex_attention":
+                    assert mask is None or isinstance(mask, BlockMask)
+                    output = flex_attention_comp(q, kv, kv, block_mask=mask, enable_gqa=True)
+                    output = output.transpose(1, 2).contiguous()  # B H S D -> B S H D
+
+                elif attn_impl == "sdpa":
+                    is_causal = (mask == "causal") if isinstance(mask, str) else False
+                    attn_mask = mask if isinstance(mask, torch.Tensor) else None
+                    output = F.scaled_dot_product_attention(
+                        q, kv, kv,
+                        is_causal=is_causal,
+                        attn_mask=attn_mask,
+                        enable_gqa=True,
+                    )  # [B, H, S, C/H]
+                    output = output.transpose(1, 2).contiguous()  # B H S D -> B S H D
+
+                print(f'{attn_impl=} {output.shape=}')
+                print(f'{self.wo_absorbed.shape=}')
+                B, S, H, C = output.shape
+                # 5&6. Project through absorbed output projection
+                output = F.linear(output.view(B, S, H*C), self.wo_absorbed)
+
+            return output
+        # else:
         bsz, seqlen, _ = x.shape
 
         # Query projection
         if self.q_lora_rank == 0:
             q = self.wq(x)
         else:
-            q = self.wq_b(self.q_norm(self.wq_a(x)))
+            # compressed q
+            q_c = self.q_norm(self.wq_a(x))
+            q_emb, k_emb = freq_cis
+            # q_emb: [L, H, F, 2]
+            # flatten : [L, H * D]
+            # q_up_pinv:  [dim, (H * D)]
+            q_emb = q_emb.view(q_emb.shape[0], -1)
+            # q_emb: [dim, L]
+            down_q_emb = F.linear(q_emb, self.q_up_pinv)
+            assert down_q_emb.dtype == torch.float32
+
+            #recovered_q_emb = self.wq_b(down_q_emb.to(self.wq_b.weight.dtype))
+            recovered_q_emb = F.linear(down_q_emb, self.wq_b.weight.float())
+            print(f'{q_emb.dtype=}, {recovered_q_emb.dtype=}')
+
+            is_all_close = torch.allclose(q_emb, recovered_q_emb.to(q_emb.dtype))
+            print(f'{is_all_close=}')
+            if not is_all_close:
+                print(f'{recovered_q_emb=}')
+                print(f'{q_emb=}')
+                import sys
+                sys.exit()
+
+            print(f'{q_emb.shape=}, {self.q_up_pinv.shape=}, {down_q_emb.shape=}')
+            q_w_inv_rope = self.wq_b((q_c + down_q_emb).to(self.wq_b.weight.dtype))
+
+            q = self.wq_b(q_c)
+
+            #qrope, krope = apply_additive_rotary_emb(q, k, 1, (e[0:seqlen] for e in freq_cis))
         output_shape = q.shape
 
         # Reshape query
+        q_w_inv_rope = q_w_inv_rope.view(bsz, seqlen, self.n_heads, self.head_dim)
         q = q.view(bsz, seqlen, self.n_heads, self.head_dim)
 
         # Key-Value projection
         kv = self.wkv_a(x)
         kv = self.kv_norm(kv)
+
+        # This condition helps us be easily compatible
+        # with inference by adding a pluggable KVCache
+        """
+        if hasattr(self, "kv_cache_mla"):
+            # For MLA, we cache the low-rank tensor before the final projection
+            kv = self.kv_cache.update(kv, tok_idx)
+            seqlen = kv.size(1)  # Update seqlen after using KV cache
+        """
+
         # Project to keys and values using linear projection
         kv_out = self.wkv_b(kv)
         # Split into keys and values and reshape
@@ -672,18 +898,30 @@ class SimpleMLA(nn.Module):
         if rope_type == "original":
             q, k = apply_rotary_emb(q, k, 1, freq_cis[0:seqlen])
         elif rope_type == "additive":
-            q, k = apply_additive_rotary_emb(q, k, 1, freq_cis)
+            qrope, krope = apply_additive_rotary_emb(q, k, 1, (e[0:seqlen] for e in freq_cis))
+
+            q_emb, k_emb = freq_cis
+            simple_add_qrope = q + q_emb.view(1, *q.shape[1:])
+            print(f'{qrope.dtype=}, {simple_add_qrope.dtype=}')
+            #q = q_w_inv_rope
+            is_all_close = torch.allclose(qrope, simple_add_qrope.to(qrope.dtype))
+            print(f'{is_all_close=}')
+            if not is_all_close:
+                print(f'{qrope=}')
+                print(f'{simple_add_qrope=}')
+                import sys
+                sys.exit()
+            q = qrope
+            k = krope
         elif rope_type == "none":
             assert freq_cis is None, f"rope_type=none should not have freq_cis, but got {type(freq_cis)=}"
             pass
         else:
             raise ValueError(f"Unsupported rotary type: {rope_type}")
 
-        # This condition helps us be easily compatible
-        # with inference by adding a pluggable KVCache
+        # kv cache is after rope
         if hasattr(self, "kv_cache"):
             k, v = self.kv_cache.update(k, v, tok_idx)
-            seqlen = k.size(1)  # Update seqlen after using KV cache
 
         # Repeat KV heads if needed
         if self.n_heads > self.n_kv_heads:
@@ -707,7 +945,6 @@ class SimpleMLA(nn.Module):
                 attn_mask=attn_mask,
             )
             output = output.transpose(1, 2).contiguous()  # B H S D -> B S H D
-
 
         # Restore shape and project to output
         output = self.wo(output.reshape(output_shape))
@@ -767,6 +1004,7 @@ class SimpleMLA(nn.Module):
             a=-3 * init_std,
             b=3 * init_std,
         )
+
 class FeedForward(nn.Module):
     def __init__(
         self,
